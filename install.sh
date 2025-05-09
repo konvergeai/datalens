@@ -62,7 +62,7 @@ rm -rf /var/lib/apt/lists/*
 echo "Hello from Azure Extensions!" > /var/log/azure-extensions-message.txt
 
 # 10. Pull secrets from Key Vault and generate .env inside datalens directory
-VAULT="datalensvm-kv"
+VAULT="datalensvm-kv8a4f9b"
 OUT_DIR="/opt/datalens"
 OUT_FILE="$OUT_DIR/.env"
 
