@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Accept three arguments: Key Vault name, ACR username, ACR password
+VAULT="${1:?vault name required}"
+ACR_USERNAME="${2:?acr username required}"
+ACR_PASSWORD="${3:?acr password required}"
+
 # 1. Install prerequisites
 apt-get update -qq
 apt-get install -y --no-install-recommends \
@@ -45,16 +50,19 @@ apt-get install -y --no-install-recommends \
     docker-buildx-plugin \
     docker-compose-plugin
 
-# 5. Add the VM user to the docker group to access the Docker socket
+# 5. Add the VM user to the docker group
 usermod -aG docker ubuntu-user
 
 # 6. Login to Azure using the VM’s managed identity
 az login --identity
 
-# 7. Perform an ACR login
-az acr login --name datalens
+# 7. Login to your ACR using provided credentials
+echo "$ACR_PASSWORD" \
+  | docker login datalens.azurecr.io \
+      -u "$ACR_USERNAME" \
+      --password-stdin
 
-# 8. (Optional) Clean up APT caches to save space
+# 8. Clean up APT caches to save space
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
@@ -62,7 +70,6 @@ rm -rf /var/lib/apt/lists/*
 echo "Hello from Azure Extensions!" > /var/log/azure-extensions-message.txt
 
 # 10. Pull secrets from Key Vault and generate .env inside datalens directory
-VAULT="${1:?vault name required}"
 OUT_DIR="/opt/datalens"
 OUT_FILE="$OUT_DIR/.env"
 
@@ -205,7 +212,7 @@ docker run -d \
   --name react-app-dev \
   --network datalens-network \
   -p 3000:3000 \
-  -v react-app-dev-node_modules:/frontend/node_modules\
+  -v react-app-dev-node_modules:/frontend/node_modules \
   --env-file /opt/datalens/.env \
   -e NODE_ENV=development \
   -e CHOKIDAR_USEPOLLING=true \
