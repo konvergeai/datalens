@@ -5,7 +5,7 @@ set -euo pipefail
 VAULT="${1:?vault name required}"
 BLOB_BASE_URL="${2:?blob artifacts base URL required}"
 ACR_USERNAME="${3:?acr username required}"
-ACR_PASSWORD="${4:?acr password required}"
+ACR_PASSWORD="${4:-}"
 
 # 1. Install prerequisites
 apt-get update -qq
