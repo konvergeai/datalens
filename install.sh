@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Accept three arguments: Key Vault name, ACR username, ACR password
+# Accept one argument: Key Vault name
 VAULT="${1:?vault name required}"
-ACR_USERNAME="${2:?acr username required}"
-ACR_PASSWORD="${3:?acr password required}"
+BLOB_BASE_URL="${2:?blob artifacts base URL required}"
+ACR_USERNAME="${3:?acr username required}"
+ACR_PASSWORD="${4:?acr password required}"
 
 # 1. Install prerequisites
 apt-get update -qq
@@ -53,26 +54,19 @@ apt-get install -y --no-install-recommends \
 # 5. Add the VM user to the docker group
 usermod -aG docker ubuntu-user
 
-# 6. Login to Azure using the VM’s managed identity
+# 6. Login to Azure using the VM’s managed identity (needed for Key Vault)
 az login --identity
 
-# 7. Login to your ACR using provided credentials
-echo "$ACR_PASSWORD" \
-  | docker login datalens.azurecr.io \
-      -u "$ACR_USERNAME" \
-      --password-stdin
-
-# 8. Clean up APT caches to save space
+# 7. Clean up APT caches to save space
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
-# 9. Your custom extension message
+# 8. Your custom extension message
 echo "Hello from Azure Extensions!" > /var/log/azure-extensions-message.txt
 
-# 10. Pull secrets from Key Vault and generate .env inside datalens directory
+# 9. Pull secrets from Key Vault and generate .env inside datalens directory
 OUT_DIR="/opt/datalens"
 OUT_FILE="$OUT_DIR/.env"
-
 mkdir -p "$OUT_DIR"
 : > "$OUT_FILE"
 
@@ -86,8 +80,8 @@ echo "Building .env from Key Vault secrets..."
 az keyvault secret list --vault-name "$VAULT" --query "[].name" -o tsv | \
 while read -r name; do
     val=$(az keyvault secret show \
-            --vault-name="$VAULT" \
-            --name="$name" \
+            --vault-name "$VAULT" \
+            --name "$name" \
             --query value -o tsv)
 
     if [[ "$val" == *"change.me"* ]]; then
@@ -98,20 +92,17 @@ while read -r name; do
     var=$(echo "$name" | tr '[:lower:]-' '[:upper:]_')
     printf '%s=%s\n' "$var" "$val" >> "$OUT_FILE"
 done
-
 echo "→ Wrote $(wc -l < "$OUT_FILE") vars to $OUT_FILE"
 
-# 11. Ensure the 'datalens-network' external network exists
+# 10. Ensure the 'datalens-network' external network exists
 if ! docker network ls --filter name=^datalens-network$ --format '{{.Name}}' | grep -q '^datalens-network$'; then
   docker network create datalens-network
 fi
 
-# 12. Cleanup and start the Postgres container
-#    Uses secrets from /opt/datalens/.env for POSTGRES_* variables
+# 11. Cleanup and start the Postgres container
 if docker ps -aq -f name=^postgres$ | grep -q .; then
   docker rm -f postgres
 fi
-
 docker run -d \
   --name postgres \
   --network datalens-network \
@@ -124,13 +115,10 @@ docker run -d \
   --health-retries 5 \
   postgres:latest
 
-# 13. Cleanup and start the RabbitMQ container
-#    Provides AMQP port 5672 and management UI on 15672
-#    Uses built-in healthcheck via rabbitmqctl status
+# 12. Cleanup and start the RabbitMQ container
 if docker ps -aq -f name=^rabbitmq$ | grep -q .; then
   docker rm -f rabbitmq
 fi
-
 docker run -d \
   --name rabbitmq \
   --network datalens-network \
@@ -142,12 +130,10 @@ docker run -d \
   --health-retries 5 \
   rabbitmq:management
 
-# 14. Cleanup and start the Elasticsearch container
-#    Single-node discovery with security and JVM options
+# 13. Cleanup and start the Elasticsearch container
 if docker ps -aq -f name=^elasticsearch$ | grep -q .; then
   docker rm -f elasticsearch
 fi
-
 docker run -d \
   --name elasticsearch \
   --network datalens-network \
@@ -163,16 +149,32 @@ docker run -d \
   --health-retries 5 \
   docker.elastic.co/elasticsearch/elasticsearch-oss:7.10.2
 
-# 15. Prepare host bind-mount directories for DataLens API & UI
+# 14. Prepare host bind-mount directories for DataLens API & UI
 mkdir -p /opt/datalens/data/pdf \
          /opt/datalens/data/txt \
          /opt/datalens/data/csv \
          /opt/datalens/data/vectorstore \
          /opt/datalens/frontend_images
 
-# 16. Pull and start the DataLens API container
-docker pull datalens.azurecr.io/backend-datalens-api:latest
+# 15. Download & load Docker images from Blob Storage
+ARTIFACT_DIR="/opt/datalens/artifacts"
+mkdir -p "$ARTIFACT_DIR"
+echo "Downloading and loading DataLens images from blob storage..."
 
+# strip any trailing slash from the base
+BASE="${BLOB_BASE_URL%/}"
+
+for image in backend-datalens-api backend-datalens-ui frontend-react-app-dev nginx-reverse-proxy; do
+    TAR_PATH="$ARTIFACT_DIR/${image}.tar"
+    echo "→ $image: downloading..."
+    curl -sL "$BASE/${image}.tar" -o "$TAR_PATH"
+    echo "→ $image: loading into Docker..."
+    docker load -i "$TAR_PATH"
+done
+# (optional) clean up tarballs
+rm -f "$ARTIFACT_DIR"/*.tar
+
+# 16. Start the DataLens API container
 if docker ps -aq -f name=^datalens-api$ | grep -q .; then
   docker rm -f datalens-api
 fi
@@ -184,9 +186,7 @@ docker run -d \
   --env-file /opt/datalens/.env \
   datalens.azurecr.io/backend-datalens-api:latest
 
-# 17. Pull and start the DataLens UI container
-docker pull datalens.azurecr.io/backend-datalens-ui:latest
-
+# 17. Start the DataLens UI container
 if docker ps -aq -f name=^datalens-ui$ | grep -q .; then
   docker rm -f datalens-ui
 fi
@@ -201,13 +201,10 @@ docker run -d \
   --env-file /opt/datalens/.env \
   datalens.azurecr.io/backend-datalens-ui:latest
 
-# 18. Pull and start the DataLens Frontend container
-docker pull datalens.azurecr.io/frontend-react-app-dev:latest
-
+# 18. Start the DataLens Frontend container
 if docker ps -aq -f name=^react-app-dev$ | grep -q .; then
   docker rm -f react-app-dev
 fi
-
 docker run -d \
   --name react-app-dev \
   --network datalens-network \
@@ -228,20 +225,17 @@ openssl req -x509 -nodes -days 365 \
   -subj "/CN=$(hostname)"
 chmod 600 "$NGINX_CERT_DIR/"*.key
 
-# Write nginx.conf
+# 20. Write nginx.conf
 NGINX_CONF_DIR="/opt/datalens/nginx"
 mkdir -p "$NGINX_CONF_DIR"
 cat <<'EOF' > "$NGINX_CONF_DIR/nginx.conf"
-...  # (the config from step 2)
+...  # (your existing nginx config)
 EOF
 
-# 20. Pull and start the nginx reverse-proxy container
-docker pull datalens.azurecr.io/nginx-reverse-proxy:latest
-
+# 21. Start the nginx reverse-proxy container
 if docker ps -aq -f name=^reverse-proxy$ | grep -q .; then
   docker rm -f reverse-proxy
 fi
-
 docker run -d \
   --name reverse-proxy \
   --network datalens-network \
