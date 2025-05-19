@@ -124,7 +124,6 @@ docker run -d \
   --network datalens-network \
   -p 5672:5672 \
   -p 15672:15672 \
-  --env-file /opt/datalens/.env \
   --health-cmd 'rabbitmqctl status' \
   --health-interval 10s \
   --health-timeout 5s \
