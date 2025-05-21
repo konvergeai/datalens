@@ -27,7 +27,7 @@ GPT_MODEL="${8:?gpt model required}"
 JWT_SECRET_KEY="${9:?jwt secret key required}"
 CONTAINER_BLOB_BASE_URL="${10:?container blob base url required}"
 ACR_USERNAME="${11:?acr username required}"
-ACR_PASSWORD="${12:?acr password required}"
+ACR_PASSWORD="${12:-}"
 
 log "Parsed script arguments."
 
