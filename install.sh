@@ -88,8 +88,8 @@ if [[ -z "$PUBLIC_IP" || "$PUBLIC_IP" == "null" ]]; then
 fi
 log "Public IP is $PUBLIC_IP"
 
-REACT_APP_API="http://$PUBLIC_IP/api/v1/"
-REACT_APP_BASEURL="http://$PUBLIC_IP/"
+REACT_APP_API="https://$PUBLIC_IP/api/v1/"
+REACT_APP_BASEURL="https://$PUBLIC_IP/"
 
 # Install Azure CLI
 log "Installing Azure CLI..."
