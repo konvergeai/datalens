@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ----- Logging -----
+# Setup log directory and file
 LOG_DIR="/opt/datalens/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/install.log"
+
 log() {
     local msg="$1"
     echo "$(date '+%Y-%m-%d %H:%M:%S') | $msg" | tee -a "$LOG_FILE"
 }
+
 trap 'log "Script failed at line $LINENO."' ERR
 
 log "Script started."
 
-# ----- Input Arguments -----
+# Input arguments
 VM_NAME="${1:?vm name required}"
 ADMIN_USERNAME="${2:?admin username required}"
 REACT_APP_GOOGLE_CLIENT="${3:?google client required}"
@@ -29,50 +31,7 @@ ACR_PASSWORD="${12:-}"
 
 log "Parsed script arguments."
 
-# ----- Install Prerequisites -----
-log "Updating apt and enabling universe repository..."
-apt-get update -qq >> "$LOG_FILE" 2>&1
-add-apt-repository -y universe >> "$LOG_FILE" 2>&1 || true
-apt-get update -qq >> "$LOG_FILE" 2>&1
-
-log "Installing prerequisites: ca-certificates, curl, apt-transport-https, lsb-release, gnupg, jq, openssl, software-properties-common..."
-apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    apt-transport-https \
-    lsb-release \
-    gnupg \
-    jq \
-    openssl \
-    software-properties-common >> "$LOG_FILE" 2>&1
-
-if ! command -v jq >/dev/null 2>&1; then
-    log "ERROR: jq not installed!"
-    exit 2
-fi
-
-if ! command -v curl >/dev/null 2>&1; then
-    log "ERROR: curl not installed!"
-    exit 2
-fi
-
-log "All required CLI tools present."
-
-# ----- Fetch Public IP -----
-log "Fetching VM public IP..."
-PUBLIC_IP=$(curl -s -H Metadata:true \
-    "http://169.254.169.254/metadata/instance/network/interface?api-version=2021-02-01&format=json" \
-    | jq -r '.[0].ipv4.ipAddress[0].publicIpAddress')
-if [[ -z "$PUBLIC_IP" || "$PUBLIC_IP" == "null" ]]; then
-    log "ERROR: Could not retrieve public IP address from metadata service."
-    exit 1
-fi
-log "Public IP is $PUBLIC_IP"
-
-REACT_APP_API="http://$PUBLIC_IP/api/v1/"
-REACT_APP_BASEURL="http://$PUBLIC_IP/"
-
-# ----- Generate Backend Service Secrets -----
+# Generate backend service secrets
 POSTGRES_USER="postgres"
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
 POSTGRES_DB="postgres"
@@ -93,9 +52,46 @@ ALGORITHM="HS256"
 CELERY_BROKER="amqp://$RABBITMQ_USER:$RABBITMQ_PASS@$RABBITMQ_HOST:$RABBITMQ_PORT//"
 CELERY_BACKEND="db+postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
 
-log "Generated backend service secrets."
+log "Generated service credentials and app URIs."
 
-# ----- Install Azure CLI -----
+# Install prerequisites
+log "Updating APT and installing prerequisites (without jq)..."
+apt-get update -qq >> "$LOG_FILE" 2>&1
+apt-get install -y --no-install-recommends \
+    ca-certificates curl apt-transport-https lsb-release gnupg openssl >> "$LOG_FILE" 2>&1
+
+log "Attempting to install jq via apt-get..."
+if ! apt-get install -y --no-install-recommends jq >> "$LOG_FILE" 2>&1; then
+    log "Apt-get install jq failed; falling back to direct binary download."
+    curl -Lo /usr/local/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+    chmod +x /usr/local/bin/jq
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    log "ERROR: jq is not installed!"
+    exit 2
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    log "ERROR: curl is not installed!"
+    exit 2
+fi
+
+log "All required CLI tools present."
+
+# Fetch public IP for React app endpoints (now AFTER jq is installed)
+log "Fetching VM public IP..."
+PUBLIC_IP=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance/network/interface?api-version=2021-02-01&format=json" | jq -r '.[0].ipv4.ipAddress[0].publicIpAddress')
+if [[ -z "$PUBLIC_IP" || "$PUBLIC_IP" == "null" ]]; then
+  log "ERROR: Could not retrieve public IP address from metadata service."
+  exit 1
+fi
+log "Public IP is $PUBLIC_IP"
+
+REACT_APP_API="http://$PUBLIC_IP/api/v1/"
+REACT_APP_BASEURL="http://$PUBLIC_IP/"
+
+# Install Azure CLI
 log "Installing Azure CLI..."
 curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
 AZ_REPO=$(lsb_release -cs)
@@ -103,33 +99,35 @@ echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO 
 apt-get update -qq >> "$LOG_FILE" 2>&1
 apt-get install -y --no-install-recommends azure-cli >> "$LOG_FILE" 2>&1
 
-# ----- Install Docker -----
-log "Installing Docker Engine & CLI..."
+# Install Docker Engine & CLI
+log "Installing Docker Engine..."
 mkdir -p /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor | tee /etc/apt/keyrings/docker.gpg > /dev/null
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
-    | tee /etc/apt/sources.list.d/docker.list > /dev/null
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+  | tee /etc/apt/sources.list.d/docker.list > /dev/null
 apt-get update -qq >> "$LOG_FILE" 2>&1
 apt-get install -y --no-install-recommends \
     docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1
 
-# Add admin user to docker group
+# Add user to docker group
 log "Adding $ADMIN_USERNAME to docker group..."
 usermod -aG docker "$ADMIN_USERNAME" >> "$LOG_FILE" 2>&1 || log "usermod failed (may not be fatal)."
 
-# Clean up apt cache
+# Clean up APT caches
 apt-get clean
 rm -rf /var/lib/apt/lists/*
-log "System packages installed and cleaned up."
+log "System packages installed."
 
-# ----- Prepare Directories -----
+# Prepare directories
 OUT_DIR="/opt/datalens"
 mkdir -p "$OUT_DIR"
 log "Created $OUT_DIR directory."
 
-# ----- Write .env File -----
+# Build .env file with all required secrets and settings
 ENV_FILE="$OUT_DIR/.env"
 : > "$ENV_FILE"
+
 {
   echo "ALGORITHM=$ALGORITHM"
   echo "CELERY_BACKEND=$CELERY_BACKEND"
@@ -157,9 +155,10 @@ ENV_FILE="$OUT_DIR/.env"
   echo "REACT_APP_ONEDRIVE_CLIENT_ID=$REACT_APP_ONEDRIVE_CLIENT_ID"
   echo "REACT_APP_ONEDRIVE_REDIRECT_URI=$REACT_APP_ONEDRIVE_REDIRECT_URI"
 } >> "$ENV_FILE"
+
 log "Wrote environment variables to $ENV_FILE."
 
-# ----- Docker Network -----
+# Create Docker network
 if ! docker network ls --filter name=^datalens-network$ --format '{{.Name}}' | grep -q '^datalens-network$'; then
   docker network create datalens-network >> "$LOG_FILE" 2>&1
   log "Created Docker network datalens-network."
@@ -167,7 +166,7 @@ else
   log "Docker network datalens-network already exists."
 fi
 
-# ----- Host Directories for Mounts -----
+# Prepare host bind-mount directories
 mkdir -p /opt/datalens/data/pdf \
          /opt/datalens/data/txt \
          /opt/datalens/data/csv \
@@ -175,7 +174,7 @@ mkdir -p /opt/datalens/data/pdf \
          /opt/datalens/frontend_images
 log "Prepared bind-mount directories."
 
-# ----- Download & Load Docker Images -----
+# Download & load Docker images from Blob Storage
 ARTIFACT_DIR="/opt/datalens/artifacts"
 mkdir -p "$ARTIFACT_DIR"
 BASE="${CONTAINER_BLOB_BASE_URL%/}"
@@ -189,10 +188,7 @@ for image in backend-datalens-api backend-datalens-ui frontend-react-app-dev ngi
 done
 rm -f "$ARTIFACT_DIR"/*.tar
 
-# ----- Start/Restart Core Containers (Postgres, RabbitMQ, Elasticsearch) -----
-# [Container startup blocks: same as before, not repeated for brevity—keep yours as-is]
-
-# For example, Postgres:
+# Start Postgres container
 if docker ps -aq -f name=^postgres$ | grep -q .; then
   docker rm -f postgres >> "$LOG_FILE" 2>&1
   log "Removed existing postgres container."
@@ -205,9 +201,71 @@ docker run -d --name postgres --network datalens-network -p 5431:5432 \
   postgres:latest >> "$LOG_FILE" 2>&1
 log "Started Postgres container."
 
-# (Do the same for RabbitMQ, Elasticsearch, datalens-api, datalens-ui, react-app-dev, nginx-reverse-proxy as in your previous script.)
+# Start RabbitMQ container
+if docker ps -aq -f name=^rabbitmq$ | grep -q .; then
+  docker rm -f rabbitmq >> "$LOG_FILE" 2>&1
+  log "Removed existing rabbitmq container."
+fi
+docker run -d --name rabbitmq --network datalens-network -p 5672:5672 -p 15672:15672 \
+  --health-cmd 'rabbitmqctl status' --health-interval 10s \
+  --health-timeout 5s --health-retries 5 \
+  rabbitmq:management >> "$LOG_FILE" 2>&1
+log "Started RabbitMQ container."
 
-# ----- Certs and NGINX Setup -----
+# Start Elasticsearch container
+if docker ps -aq -f name=^elasticsearch$ | grep -q .; then
+  docker rm -f elasticsearch >> "$LOG_FILE" 2>&1
+  log "Removed existing elasticsearch container."
+fi
+docker run -d --name elasticsearch --network datalens-network -p 9200:9200 -p 9300:9300 \
+  -v elasticsearch_data:/usr/share/elasticsearch/data \
+  --env-file "$ENV_FILE" \
+  --env discovery.type=single-node \
+  --env 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
+  --health-cmd 'curl -f http://localhost:9200' --health-interval 10s \
+  --health-timeout 5s --health-retries 5 \
+  docker.elastic.co/elasticsearch/elasticsearch-oss:7.10.2 >> "$LOG_FILE" 2>&1
+log "Started Elasticsearch container."
+
+# Start DataLens API container
+if docker ps -aq -f name=^datalens-api$ | grep -q .; then
+  docker rm -f datalens-api >> "$LOG_FILE" 2>&1
+  log "Removed existing datalens-api container."
+fi
+docker run -d --name datalens-api --network datalens-network -p 8000:8000 \
+  -v /opt/datalens/data:/app/data \
+  --env-file "$ENV_FILE" \
+  datalens.azurecr.io/backend-datalens-api:latest >> "$LOG_FILE" 2>&1
+log "Started DataLens API container."
+
+# Start DataLens UI container
+if docker ps -aq -f name=^datalens-ui$ | grep -q .; then
+  docker rm -f datalens-ui >> "$LOG_FILE" 2>&1
+  log "Removed existing datalens-ui container."
+fi
+docker run -d --name datalens-ui --network datalens-network -p 8501:8501 \
+  -v /opt/datalens/data/pdf:/app/data/pdf \
+  -v /opt/datalens/data/txt:/app/data/txt \
+  -v /opt/datalens/data/csv:/app/data/csv \
+  -v /opt/datalens/data/vectorstore:/app/data/vectorstore \
+  --env-file "$ENV_FILE" \
+  datalens.azurecr.io/backend-datalens-ui:latest >> "$LOG_FILE" 2>&1
+log "Started DataLens UI container."
+
+# Start DataLens Frontend container
+if docker ps -aq -f name=^react-app-dev$ | grep -q .; then
+  docker rm -f react-app-dev >> "$LOG_FILE" 2>&1
+  log "Removed existing react-app-dev container."
+fi
+docker run -d --name react-app-dev --network datalens-network -p 3000:3000 \
+  -v react-app-dev-node_modules:/frontend/node_modules \
+  --env-file "$ENV_FILE" \
+  -e NODE_ENV=development \
+  -e CHOKIDAR_USEPOLLING=true \
+  datalens.azurecr.io/frontend-react-app-dev:latest >> "$LOG_FILE" 2>&1
+log "Started DataLens Frontend container."
+
+# Start nginx reverse-proxy container
 NGINX_CERT_DIR="/etc/nginx/certs"
 mkdir -p "$NGINX_CERT_DIR"
 openssl req -x509 -nodes -days 365 \
