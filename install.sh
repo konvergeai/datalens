@@ -1,245 +1,253 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Accept one argument: Key Vault name
-VAULT="${1:?vault name required}"
-BLOB_BASE_URL="${2:?blob artifacts base URL required}"
-ACR_USERNAME="${3:?acr username required}"
-ACR_PASSWORD="${4:-}"
+# Setup log directory and file
+LOG_DIR="/opt/datalens/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/install.log"
 
-# 1. Install prerequisites
-apt-get update -qq
+log() {
+    local msg="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $msg" | tee -a "$LOG_FILE"
+}
+
+trap 'log "Script failed at line $LINENO."' ERR
+
+log "Script started."
+
+# Input arguments
+VM_NAME="${1:?vm name required}"
+ADMIN_USERNAME="${2:?admin username required}"
+REACT_APP_GOOGLE_CLIENT="${3:?google client required}"
+REACT_APP_ONEDRIVE_CLIENT_ID="${4:-}"
+REACT_APP_ONEDRIVE_AUTHORITY="${5:-}"
+REACT_APP_ONEDRIVE_REDIRECT_URI="${6:-}"
+OPENAI_API_KEY="${7:?openai api key required}"
+GPT_MODEL="${8:?gpt model required}"
+JWT_SECRET_KEY="${9:?jwt secret key required}"
+CONTAINER_BLOB_BASE_URL="${10:?container blob base url required}"
+ACR_USERNAME="${11:?acr username required}"
+ACR_PASSWORD="${12:?acr password required}"
+
+log "Parsed script arguments."
+
+# Generate backend service secrets
+POSTGRES_USER="postgres"
+POSTGRES_PASSWORD=$(openssl rand -hex 16)
+POSTGRES_DB="postgres"
+POSTGRES_HOST="localhost"
+POSTGRES_PORT="5432"
+
+RABBITMQ_USER="guest"
+RABBITMQ_PASS="guest"
+RABBITMQ_HOST="localhost"
+RABBITMQ_PORT="5672"
+
+ELASTICSEARCH_USER="elastic"
+ELASTICSEARCH_PASSWORD=$(openssl rand -hex 16)
+ELASTICSEARCH_HOST="localhost"
+ELASTICSEARCH_PORT="9200"
+
+log "Generated service credentials."
+
+# Install prerequisites
+log "Updating APT and installing prerequisites..."
+apt-get update -qq >> "$LOG_FILE" 2>&1
 apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    apt-transport-https \
-    lsb-release \
-    gnupg \
-    jq
+    ca-certificates curl apt-transport-https lsb-release gnupg jq >> "$LOG_FILE" 2>&1
 
-# 2. Import Microsoft GPG key and add Azure CLI repo
-curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-  | gpg --dearmor \
-  | tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
-
+# Install Azure CLI
+log "Installing Azure CLI..."
+curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
 AZ_REPO=$(lsb_release -cs)
-echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" \
-  | tee /etc/apt/sources.list.d/azure-cli.list
+echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" | tee /etc/apt/sources.list.d/azure-cli.list
+apt-get update -qq >> "$LOG_FILE" 2>&1
+apt-get install -y --no-install-recommends azure-cli >> "$LOG_FILE" 2>&1
 
-# 3. Install the Azure CLI
-apt-get update -qq
-apt-get install -y --no-install-recommends azure-cli
-
-# 4. Install Docker Engine & CLI plugins
+# Install Docker Engine & CLI
+log "Installing Docker Engine..."
 mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | gpg --dearmor \
-  | tee /etc/apt/keyrings/docker.gpg > /dev/null
-
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor | tee /etc/apt/keyrings/docker.gpg > /dev/null
 echo \
-  "deb [arch=$(dpkg --print-architecture) \
-        signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/ubuntu \
-    $(lsb_release -cs) stable" \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
   | tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-apt-get update -qq
+apt-get update -qq >> "$LOG_FILE" 2>&1
 apt-get install -y --no-install-recommends \
-    docker-ce \
-    docker-ce-cli \
-    containerd.io \
-    docker-buildx-plugin \
-    docker-compose-plugin
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1
 
-# 5. Add the VM user to the docker group
-usermod -aG docker ubuntu-user
+# Add user to docker group
+log "Adding $ADMIN_USERNAME to docker group..."
+usermod -aG docker "$ADMIN_USERNAME" >> "$LOG_FILE" 2>&1 || log "usermod failed (may not be fatal)."
 
-# 6. Login to Azure using the VM’s managed identity (needed for Key Vault)
-az login --identity
-
-# 7. Clean up APT caches to save space
+# Clean up APT caches
 apt-get clean
 rm -rf /var/lib/apt/lists/*
+log "System packages installed."
 
-# 8. Your custom extension message
-echo "Hello from Azure Extensions!" > /var/log/azure-extensions-message.txt
-
-# 9. Pull secrets from Key Vault and generate .env inside datalens directory
+# Prepare directories
 OUT_DIR="/opt/datalens"
-OUT_FILE="$OUT_DIR/.env"
 mkdir -p "$OUT_DIR"
-: > "$OUT_FILE"
+log "Created $OUT_DIR directory."
 
-echo "Fetching VM public IP..."
-PUBLIC_IP=$(curl -s -H Metadata:true \
-  "http://169.254.169.254/metadata/instance/network/interface?api-version=2021-02-01&format=json" \
-  | jq -r '.[0].ipv4.ipAddress[0].publicIpAddress')
-echo "→ Public IP is $PUBLIC_IP"
+# Build .env file
+ENV_FILE="$OUT_DIR/.env"
+: > "$ENV_FILE"
 
-echo "Building .env from Key Vault secrets..."
-az keyvault secret list --vault-name "$VAULT" --query "[].name" -o tsv | \
-while read -r name; do
-    val=$(az keyvault secret show \
-            --vault-name "$VAULT" \
-            --name "$name" \
-            --query value -o tsv)
+{
+  echo "REACT_APP_GOOGLE_CLIENT=$REACT_APP_GOOGLE_CLIENT"
+  echo "REACT_APP_ONEDRIVE_CLIENT_ID=$REACT_APP_ONEDRIVE_CLIENT_ID"
+  echo "REACT_APP_ONEDRIVE_AUTHORITY=$REACT_APP_ONEDRIVE_AUTHORITY"
+  echo "REACT_APP_ONEDRIVE_REDIRECT_URI=$REACT_APP_ONEDRIVE_REDIRECT_URI"
+  echo "OPENAI_API_KEY=$OPENAI_API_KEY"
+  echo "GPT_MODEL=$GPT_MODEL"
+  echo "JWT_SECRET_KEY=$JWT_SECRET_KEY"
+  echo "POSTGRES_USER=$POSTGRES_USER"
+  echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+  echo "POSTGRES_DB=$POSTGRES_DB"
+  echo "POSTGRES_HOST=$POSTGRES_HOST"
+  echo "POSTGRES_PORT=$POSTGRES_PORT"
+  echo "RABBITMQ_USER=$RABBITMQ_USER"
+  echo "RABBITMQ_PASS=$RABBITMQ_PASS"
+  echo "RABBITMQ_HOST=$RABBITMQ_HOST"
+  echo "RABBITMQ_PORT=$RABBITMQ_PORT"
+  echo "ELASTICSEARCH_USER=$ELASTICSEARCH_USER"
+  echo "ELASTICSEARCH_PASSWORD=$ELASTICSEARCH_PASSWORD"
+  echo "ELASTICSEARCH_HOST=$ELASTICSEARCH_HOST"
+  echo "ELASTICSEARCH_PORT=$ELASTICSEARCH_PORT"
+} >> "$ENV_FILE"
 
-    if [[ "$val" == *"change.me"* ]]; then
-      echo "  • Replacing placeholder in $name"
-      val="${val//change.me/$PUBLIC_IP}"
-    fi
+log "Wrote environment variables to $ENV_FILE."
 
-    var=$(echo "$name" | tr '[:lower:]-' '[:upper:]_')
-    printf '%s=%s\n' "$var" "$val" >> "$OUT_FILE"
-done
-echo "→ Wrote $(wc -l < "$OUT_FILE") vars to $OUT_FILE"
-
-# 10. Ensure the 'datalens-network' external network exists
+# Create Docker network
 if ! docker network ls --filter name=^datalens-network$ --format '{{.Name}}' | grep -q '^datalens-network$'; then
-  docker network create datalens-network
+  docker network create datalens-network >> "$LOG_FILE" 2>&1
+  log "Created Docker network datalens-network."
+else
+  log "Docker network datalens-network already exists."
 fi
 
-# 11. Cleanup and start the Postgres container
-if docker ps -aq -f name=^postgres$ | grep -q .; then
-  docker rm -f postgres
-fi
-docker run -d \
-  --name postgres \
-  --network datalens-network \
-  -p 5431:5432 \
-  -v postgres_data:/var/lib/postgresql/data \
-  --env-file /opt/datalens/.env \
-  --health-cmd 'pg_isready -U $${POSTGRES_USER}' \
-  --health-interval 10s \
-  --health-timeout 5s \
-  --health-retries 5 \
-  postgres:latest
-
-# 12. Cleanup and start the RabbitMQ container
-if docker ps -aq -f name=^rabbitmq$ | grep -q .; then
-  docker rm -f rabbitmq
-fi
-docker run -d \
-  --name rabbitmq \
-  --network datalens-network \
-  -p 5672:5672 \
-  -p 15672:15672 \
-  --health-cmd 'rabbitmqctl status' \
-  --health-interval 10s \
-  --health-timeout 5s \
-  --health-retries 5 \
-  rabbitmq:management
-
-# 13. Cleanup and start the Elasticsearch container
-if docker ps -aq -f name=^elasticsearch$ | grep -q .; then
-  docker rm -f elasticsearch
-fi
-docker run -d \
-  --name elasticsearch \
-  --network datalens-network \
-  -p 9200:9200 \
-  -p 9300:9300 \
-  -v elasticsearch_data:/usr/share/elasticsearch/data \
-  --env-file /opt/datalens/.env \
-  --env discovery.type=single-node \
-  --env 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
-  --health-cmd 'curl -f http://localhost:9200' \
-  --health-interval 10s \
-  --health-timeout 5s \
-  --health-retries 5 \
-  docker.elastic.co/elasticsearch/elasticsearch-oss:7.10.2
-
-# 14. Prepare host bind-mount directories for DataLens API & UI
+# Prepare host bind-mount directories
 mkdir -p /opt/datalens/data/pdf \
          /opt/datalens/data/txt \
          /opt/datalens/data/csv \
          /opt/datalens/data/vectorstore \
          /opt/datalens/frontend_images
+log "Prepared bind-mount directories."
 
-# 15. Download & load Docker images from Blob Storage
+# Download & load Docker images from Blob Storage
 ARTIFACT_DIR="/opt/datalens/artifacts"
 mkdir -p "$ARTIFACT_DIR"
-echo "Downloading and loading DataLens images from blob storage..."
-
-# strip any trailing slash from the base
-BASE="${BLOB_BASE_URL%/}"
-
+BASE="${CONTAINER_BLOB_BASE_URL%/}"
+log "Downloading images from $BASE..."
 for image in backend-datalens-api backend-datalens-ui frontend-react-app-dev nginx-reverse-proxy; do
     TAR_PATH="$ARTIFACT_DIR/${image}.tar"
-    echo "→ $image: downloading..."
+    log "Downloading $image..."
     curl -sL "$BASE/${image}.tar" -o "$TAR_PATH"
-    echo "→ $image: loading into Docker..."
-    docker load -i "$TAR_PATH"
+    log "Loading $image into Docker..."
+    docker load -i "$TAR_PATH" >> "$LOG_FILE" 2>&1
 done
-# (optional) clean up tarballs
 rm -f "$ARTIFACT_DIR"/*.tar
 
-# 16. Start the DataLens API container
-if docker ps -aq -f name=^datalens-api$ | grep -q .; then
-  docker rm -f datalens-api
+# Start Postgres container
+if docker ps -aq -f name=^postgres$ | grep -q .; then
+  docker rm -f postgres >> "$LOG_FILE" 2>&1
+  log "Removed existing postgres container."
 fi
-docker run -d \
-  --name datalens-api \
-  --network datalens-network \
-  -p 8000:8000 \
-  -v /opt/datalens/data:/app/data \
-  --env-file /opt/datalens/.env \
-  datalens.azurecr.io/backend-datalens-api:latest
+docker run -d --name postgres --network datalens-network -p 5431:5432 \
+  -v postgres_data:/var/lib/postgresql/data \
+  --env-file "$ENV_FILE" \
+  --health-cmd 'pg_isready -U $${POSTGRES_USER}' --health-interval 10s \
+  --health-timeout 5s --health-retries 5 \
+  postgres:latest >> "$LOG_FILE" 2>&1
+log "Started Postgres container."
 
-# 17. Start the DataLens UI container
-if docker ps -aq -f name=^datalens-ui$ | grep -q .; then
-  docker rm -f datalens-ui
+# Start RabbitMQ container
+if docker ps -aq -f name=^rabbitmq$ | grep -q .; then
+  docker rm -f rabbitmq >> "$LOG_FILE" 2>&1
+  log "Removed existing rabbitmq container."
 fi
-docker run -d \
-  --name datalens-ui \
-  --network datalens-network \
-  -p 8501:8501 \
+docker run -d --name rabbitmq --network datalens-network -p 5672:5672 -p 15672:15672 \
+  --health-cmd 'rabbitmqctl status' --health-interval 10s \
+  --health-timeout 5s --health-retries 5 \
+  rabbitmq:management >> "$LOG_FILE" 2>&1
+log "Started RabbitMQ container."
+
+# Start Elasticsearch container
+if docker ps -aq -f name=^elasticsearch$ | grep -q .; then
+  docker rm -f elasticsearch >> "$LOG_FILE" 2>&1
+  log "Removed existing elasticsearch container."
+fi
+docker run -d --name elasticsearch --network datalens-network -p 9200:9200 -p 9300:9300 \
+  -v elasticsearch_data:/usr/share/elasticsearch/data \
+  --env-file "$ENV_FILE" \
+  --env discovery.type=single-node \
+  --env 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
+  --health-cmd 'curl -f http://localhost:9200' --health-interval 10s \
+  --health-timeout 5s --health-retries 5 \
+  docker.elastic.co/elasticsearch/elasticsearch-oss:7.10.2 >> "$LOG_FILE" 2>&1
+log "Started Elasticsearch container."
+
+# Start DataLens API container
+if docker ps -aq -f name=^datalens-api$ | grep -q .; then
+  docker rm -f datalens-api >> "$LOG_FILE" 2>&1
+  log "Removed existing datalens-api container."
+fi
+docker run -d --name datalens-api --network datalens-network -p 8000:8000 \
+  -v /opt/datalens/data:/app/data \
+  --env-file "$ENV_FILE" \
+  datalens.azurecr.io/backend-datalens-api:latest >> "$LOG_FILE" 2>&1
+log "Started DataLens API container."
+
+# Start DataLens UI container
+if docker ps -aq -f name=^datalens-ui$ | grep -q .; then
+  docker rm -f datalens-ui >> "$LOG_FILE" 2>&1
+  log "Removed existing datalens-ui container."
+fi
+docker run -d --name datalens-ui --network datalens-network -p 8501:8501 \
   -v /opt/datalens/data/pdf:/app/data/pdf \
   -v /opt/datalens/data/txt:/app/data/txt \
   -v /opt/datalens/data/csv:/app/data/csv \
   -v /opt/datalens/data/vectorstore:/app/data/vectorstore \
-  --env-file /opt/datalens/.env \
-  datalens.azurecr.io/backend-datalens-ui:latest
+  --env-file "$ENV_FILE" \
+  datalens.azurecr.io/backend-datalens-ui:latest >> "$LOG_FILE" 2>&1
+log "Started DataLens UI container."
 
-# 18. Start the DataLens Frontend container
+# Start DataLens Frontend container
 if docker ps -aq -f name=^react-app-dev$ | grep -q .; then
-  docker rm -f react-app-dev
+  docker rm -f react-app-dev >> "$LOG_FILE" 2>&1
+  log "Removed existing react-app-dev container."
 fi
-docker run -d \
-  --name react-app-dev \
-  --network datalens-network \
-  -p 3000:3000 \
+docker run -d --name react-app-dev --network datalens-network -p 3000:3000 \
   -v react-app-dev-node_modules:/frontend/node_modules \
-  --env-file /opt/datalens/.env \
+  --env-file "$ENV_FILE" \
   -e NODE_ENV=development \
   -e CHOKIDAR_USEPOLLING=true \
-  datalens.azurecr.io/frontend-react-app-dev:latest
+  datalens.azurecr.io/frontend-react-app-dev:latest >> "$LOG_FILE" 2>&1
+log "Started DataLens Frontend container."
 
-# 19. Generate certs
+# Start nginx reverse-proxy container
 NGINX_CERT_DIR="/etc/nginx/certs"
 mkdir -p "$NGINX_CERT_DIR"
 openssl req -x509 -nodes -days 365 \
   -newkey rsa:2048 \
   -keyout "$NGINX_CERT_DIR/nginx.key" \
-  -out    "$NGINX_CERT_DIR/nginx.crt" \
-  -subj "/CN=$(hostname)"
+  -out "$NGINX_CERT_DIR/nginx.crt" \
+  -subj "/CN=$(hostname)" >> "$LOG_FILE" 2>&1
 chmod 600 "$NGINX_CERT_DIR/"*.key
 
-# 20. Write nginx.conf
 NGINX_CONF_DIR="/opt/datalens/nginx"
 mkdir -p "$NGINX_CONF_DIR"
 cat <<'EOF' > "$NGINX_CONF_DIR/nginx.conf"
-...  # (your existing nginx config)
+# (Your nginx configuration here)
 EOF
 
-# 21. Start the nginx reverse-proxy container
 if docker ps -aq -f name=^reverse-proxy$ | grep -q .; then
-  docker rm -f reverse-proxy
+  docker rm -f reverse-proxy >> "$LOG_FILE" 2>&1
+  log "Removed existing reverse-proxy container."
 fi
-docker run -d \
-  --name reverse-proxy \
-  --network datalens-network \
-  -p 80:80 \
-  -p 443:443 \
+docker run -d --name reverse-proxy --network datalens-network -p 80:80 -p 443:443 \
   -v /etc/nginx/certs:/etc/nginx/certs:ro \
-  datalens.azurecr.io/nginx-reverse-proxy:latest
+  datalens.azurecr.io/nginx-reverse-proxy:latest >> "$LOG_FILE" 2>&1
+log "Started nginx reverse-proxy container."
+
+log "DataLens provisioning script completed successfully."
