@@ -53,6 +53,14 @@ ALGORITHM="HS256"
 CELERY_BROKER="amqp://$RABBITMQ_USER:$RABBITMQ_PASS@$RABBITMQ_HOST:$RABBITMQ_PORT//"
 CELERY_BACKEND="db+postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
 
+log "Generated service credentials and app URIs."
+
+# Install prerequisites
+log "Updating APT and installing prerequisites..."
+apt-get update -qq >> "$LOG_FILE" 2>&1
+apt-get install -y --no-install-recommends \
+    ca-certificates curl apt-transport-https lsb-release gnupg jq >> "$LOG_FILE" 2>&1
+
 # Fetch public IP for React app endpoints
 log "Fetching VM public IP..."
 PUBLIC_IP=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance/network/interface?api-version=2021-02-01&format=json" | jq -r '.[0].ipv4.ipAddress[0].publicIpAddress')
@@ -64,14 +72,6 @@ log "Public IP is $PUBLIC_IP"
 
 REACT_APP_API="http://$PUBLIC_IP/api/v1/"
 REACT_APP_BASEURL="http://$PUBLIC_IP/"
-
-log "Generated service credentials and app URIs."
-
-# Install prerequisites
-log "Updating APT and installing prerequisites..."
-apt-get update -qq >> "$LOG_FILE" 2>&1
-apt-get install -y --no-install-recommends \
-    ca-certificates curl apt-transport-https lsb-release gnupg jq >> "$LOG_FILE" 2>&1
 
 # Install Azure CLI
 log "Installing Azure CLI..."
